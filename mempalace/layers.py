@@ -20,10 +20,12 @@ import os
 import sys
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime
 
 import chromadb
 
 from .config import MempalaceConfig
+from .dialect import Dialect
 
 
 # ---------------------------------------------------------------------------
@@ -82,11 +84,43 @@ class Layer1:
 
     MAX_DRAWERS = 15  # at most 15 moments in wake-up
     MAX_CHARS = 3200  # hard cap on total L1 text (~800 tokens)
+    RECENT_RAW_COUNT = 3  # keep newest N entries raw; compress older context
 
-    def __init__(self, palace_path: str = None, wing: str = None):
+    def __init__(
+        self,
+        palace_path: str = None,
+        wing: str = None,
+        aaak_older_context: bool = True,
+    ):
         cfg = MempalaceConfig()
         self.palace_path = palace_path or cfg.palace_path
         self.wing = wing
+        self.aaak_older_context = aaak_older_context
+        self.dialect = Dialect() if aaak_older_context else None
+
+    @staticmethod
+    def _parse_filed_at(meta: dict) -> datetime:
+        filed_at = (meta or {}).get("filed_at", "")
+        if not filed_at:
+            return datetime.min
+        try:
+            return datetime.fromisoformat(filed_at.replace("Z", "+00:00"))
+        except ValueError:
+            return datetime.min
+
+    def _format_l1_snippet(self, doc: str, meta: dict, keep_raw: bool) -> str:
+        snippet = doc.strip().replace("\n", " ")
+        if keep_raw or not self.dialect:
+            if len(snippet) > 200:
+                snippet = snippet[:197] + "..."
+            return snippet
+
+        compressed = self.dialect.compress(doc, metadata=meta)
+        # Keep wake-up on a single line for prompt stability.
+        compressed = compressed.replace("\n", " ; ")
+        if len(compressed) > 200:
+            compressed = compressed[:197] + "..."
+        return compressed
 
     def generate(self) -> str:
         """Pull top drawers from ChromaDB and format as compact L1 text."""
@@ -140,11 +174,19 @@ class Layer1:
         scored.sort(key=lambda x: x[0], reverse=True)
         top = scored[: self.MAX_DRAWERS]
 
+        # Newest entries stay raw; older context gets AAAK-compressed.
+        top_recent = sorted(
+            enumerate(top),
+            key=lambda x: self._parse_filed_at(x[1][1]),
+            reverse=True,
+        )
+        recent_raw_indexes = {idx for idx, _ in top_recent[: self.RECENT_RAW_COUNT]}
+
         # Group by room for readability
         by_room = defaultdict(list)
-        for imp, meta, doc in top:
+        for idx, (imp, meta, doc) in enumerate(top):
             room = meta.get("room", "general")
-            by_room[room].append((imp, meta, doc))
+            by_room[room].append((idx, imp, meta, doc))
 
         # Build compact text
         lines = ["## L1 — ESSENTIAL STORY"]
@@ -155,13 +197,14 @@ class Layer1:
             lines.append(room_line)
             total_len += len(room_line)
 
-            for imp, meta, doc in entries:
+            for idx, imp, meta, doc in entries:
                 source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
 
-                # Truncate doc to keep L1 compact
-                snippet = doc.strip().replace("\n", " ")
-                if len(snippet) > 200:
-                    snippet = snippet[:197] + "..."
+                snippet = self._format_l1_snippet(
+                    doc,
+                    meta,
+                    keep_raw=idx in recent_raw_indexes,
+                )
 
                 entry_line = f"  - {snippet}"
                 if source:
@@ -189,9 +232,11 @@ class Layer2:
     Queries ChromaDB with a wing/room filter.
     """
 
-    def __init__(self, palace_path: str = None):
+    def __init__(self, palace_path: str = None, aaak_retrieval: bool = True):
         cfg = MempalaceConfig()
         self.palace_path = palace_path or cfg.palace_path
+        self.aaak_retrieval = aaak_retrieval
+        self.dialect = Dialect() if aaak_retrieval else None
 
     def retrieve(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
         """Retrieve drawers filtered by wing and/or room."""
@@ -231,7 +276,10 @@ class Layer2:
         for doc, meta in zip(docs[:n_results], metas[:n_results]):
             room_name = meta.get("room", "?")
             source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
-            snippet = doc.strip().replace("\n", " ")
+            if self.dialect:
+                snippet = self.dialect.compress(doc, metadata=meta).replace("\n", " ; ")
+            else:
+                snippet = doc.strip().replace("\n", " ")
             if len(snippet) > 300:
                 snippet = snippet[:297] + "..."
             entry = f"  [{room_name}] {snippet}"
@@ -253,9 +301,11 @@ class Layer3:
     Reuses searcher.py logic against mempalace_drawers.
     """
 
-    def __init__(self, palace_path: str = None):
+    def __init__(self, palace_path: str = None, aaak_retrieval: bool = True):
         cfg = MempalaceConfig()
         self.palace_path = palace_path or cfg.palace_path
+        self.aaak_retrieval = aaak_retrieval
+        self.dialect = Dialect() if aaak_retrieval else None
 
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
         """Semantic search, returns compact result text."""
@@ -300,7 +350,10 @@ class Layer3:
             room_name = meta.get("room", "?")
             source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
 
-            snippet = doc.strip().replace("\n", " ")
+            if self.dialect:
+                snippet = self.dialect.compress(doc, metadata=meta).replace("\n", " ; ")
+            else:
+                snippet = doc.strip().replace("\n", " ")
             if len(snippet) > 300:
                 snippet = snippet[:297] + "..."
 
@@ -376,15 +429,21 @@ class MemoryStack:
         print(stack.search("pricing change"))  # L3 deep search
     """
 
-    def __init__(self, palace_path: str = None, identity_path: str = None):
+    def __init__(
+        self,
+        palace_path: str = None,
+        identity_path: str = None,
+        aaak_older_context: bool = True,
+        aaak_retrieval: bool = True,
+    ):
         cfg = MempalaceConfig()
         self.palace_path = palace_path or cfg.palace_path
         self.identity_path = identity_path or os.path.expanduser("~/.mempalace/identity.txt")
 
         self.l0 = Layer0(self.identity_path)
-        self.l1 = Layer1(self.palace_path)
-        self.l2 = Layer2(self.palace_path)
-        self.l3 = Layer3(self.palace_path)
+        self.l1 = Layer1(self.palace_path, aaak_older_context=aaak_older_context)
+        self.l2 = Layer2(self.palace_path, aaak_retrieval=aaak_retrieval)
+        self.l3 = Layer3(self.palace_path, aaak_retrieval=aaak_retrieval)
 
     def wake_up(self, wing: str = None) -> str:
         """
