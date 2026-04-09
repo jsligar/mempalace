@@ -316,8 +316,15 @@ def cmd_compress(args):
         compressed = dialect.compress(doc, metadata=meta)
         stats = dialect.compression_stats(doc, compressed)
 
-        total_original += stats["original_chars"]
-        total_compressed += stats["compressed_chars"]
+        # Accept both current and legacy stat key names.
+        original_chars = stats.get("original_chars", 0)
+        compressed_chars = stats.get("summary_chars", stats.get("compressed_chars", 0))
+        original_tokens = stats.get("original_tokens_est", stats.get("original_tokens", 0))
+        compressed_tokens = stats.get("summary_tokens_est", stats.get("compressed_tokens", 0))
+        ratio_value = stats.get("size_ratio", stats.get("ratio", 0.0))
+
+        total_original += original_chars
+        total_compressed += compressed_chars
 
         compressed_entries.append((doc_id, compressed, meta, stats))
 
@@ -326,9 +333,7 @@ def cmd_compress(args):
             room_name = meta.get("room", "?")
             source = Path(meta.get("source_file", "?")).name
             print(f"  [{wing_name}/{room_name}] {source}")
-            print(
-                f"    {stats['original_tokens']}t -> {stats['compressed_tokens']}t ({stats['ratio']:.1f}x)"
-            )
+            print(f"    {original_tokens}t -> {compressed_tokens}t ({ratio_value:.1f}x)")
             print(f"    {compressed}")
             print()
 
@@ -338,8 +343,12 @@ def cmd_compress(args):
             comp_col = client.get_or_create_collection("mempalace_compressed")
             for doc_id, compressed, meta, stats in compressed_entries:
                 comp_meta = dict(meta)
-                comp_meta["compression_ratio"] = round(stats["ratio"], 1)
-                comp_meta["original_tokens"] = stats["original_tokens"]
+                comp_meta["compression_ratio"] = round(
+                    stats.get("size_ratio", stats.get("ratio", 0.0)), 1
+                )
+                comp_meta["original_tokens"] = stats.get(
+                    "original_tokens_est", stats.get("original_tokens", 0)
+                )
                 comp_col.upsert(
                     ids=[doc_id],
                     documents=[compressed],
